@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "Atech x Quanser QArm Mini Integration",
+			"path": "../../../../Documents/PlatformIO/Projects/Atech x Quanser QArm Mini Integration"
+		},
+		{
+			"name": "Atech x Quanser Qarm Mini Integration",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}
