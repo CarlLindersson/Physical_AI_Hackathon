@@ -41,6 +41,7 @@ QARM_SERIAL_PORT = os.getenv("QARM_SERIAL_PORT", "/dev/ttyUSB0")
 QARM_BAUD = int(os.getenv("QARM_BAUD_RATE", "115200"))
 USE_ROBOT = os.getenv("USE_ROBOT", "true").lower() == "true"
 USE_SDK = os.getenv("USE_SDK", "true").lower() == "true"
+AUTO_PICK_ON_DETECT = os.getenv("AUTO_PICK_ON_DETECT", "false").lower() == "true"
 
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 FRAME_WIDTH = int(os.getenv("CAMERA_WIDTH", "640"))
@@ -112,6 +113,10 @@ class TrashSortingDemo:
         self.start_time = time.time()
         self.last_detection = None
         self.detected_objects = []
+        self.auto_mode = False
+        self.auto_start = AUTO_PICK_ON_DETECT
+        self.auto_started = False
+        self.auto_mode = False
         
         print("="*60)
         print("QArmMini Trash Sorting - Live Detection")
@@ -129,6 +134,8 @@ class TrashSortingDemo:
         print("  p - Pick current object")
         print("  a - Auto pick all visible objects")
         print("  h - Home position")
+        if self.auto_start:
+            print("  Auto-start mode: enabled (AUTO_PICK_ON_DETECT=true)")
         print("="*60 + "\n")
     
     def run_detection(self, frame):
@@ -313,14 +320,17 @@ class TrashSortingDemo:
             return
 
         print("\n→ STARTING AUTO PICK SEQUENCE")
+        self.auto_mode = True
         ret, frame = self.cap.read()
         if not ret:
             print("Failed to read frame for auto sequence")
+            self.auto_mode = False
             return
 
         frame, _ = self.process_frame(frame)
         if not self.detected_objects:
             print("No objects detected in frame. Auto sequence complete.")
+            self.auto_mode = False
             return
 
         objects = self.sort_objects_for_pick(self.detected_objects)
@@ -340,6 +350,7 @@ class TrashSortingDemo:
             if not self.detected_objects:
                 print("No remaining objects detected. Sequence finished.")
                 break
+        self.auto_mode = False
         print("Auto pick sequence finished")
 
     def draw_ui(self, frame):
@@ -359,6 +370,9 @@ class TrashSortingDemo:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, f"Frames: {self.frame_count}", (w-200, 25),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if getattr(self, 'auto_mode', False):
+            cv2.putText(frame, "AUTO PICK MODE", (10, 85),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         
         return frame
     
@@ -374,6 +388,12 @@ class TrashSortingDemo:
                 # Process frame
                 frame, best = self.process_frame(frame)
                 
+                # Auto-start after detection if enabled
+                if self.auto_start and not self.auto_started and self.detected_objects:
+                    print("\nAuto-start triggered: detected objects, starting pick sequence")
+                    self.auto_started = True
+                    self.execute_pick_sequence()
+
                 # Draw UI
                 frame = self.draw_ui(frame)
                 

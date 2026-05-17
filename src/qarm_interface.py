@@ -36,6 +36,7 @@ class QArmMiniRobot:
         self.ser = None
         self.joint_cmd = None
         self.gripper_cmd = GRIPPER_OPEN
+        self.sdk_cartesian_supported = False
         
         # Try Quanser SDK first if requested
         if use_sdk:
@@ -46,6 +47,11 @@ class QArmMiniRobot:
                 self.joint_cmd = self.arm.HOME_POSE.copy()
                 self.gripper_cmd = GRIPPER_OPEN
                 self.connected = True
+                self.sdk_cartesian_supported = (
+                    hasattr(self.arm, "move_cartesian") or hasattr(self.arm, "move_to")
+                )
+                if not self.sdk_cartesian_supported:
+                    print("⚠ SDK connected but cartesian move support not detected.")
                 return
             except ImportError:
                 print("⚠ Quanser SDK not available, falling back to serial")
@@ -96,7 +102,9 @@ class QArmMiniRobot:
             if hasattr(self.arm, "move_to"):
                 self.arm.move_to(x, y, z)
                 return True
-            print("⚠ SDK does not expose a cartesian move method")
+            methods = [m for m in dir(self.arm) if not m.startswith("_")]
+            print("⚠ SDK does not expose a supported cartesian move method. Available arm methods:")
+            print(" ", ", ".join(m for m in methods if 'move' in m.lower() or 'write' in m.lower() or 'cmd' in m.lower()))
             return False
 
         cmd = f"MOVE {x:.3f} {y:.3f} {z:.3f}"
@@ -138,6 +146,9 @@ class QArmMiniRobot:
 
         try:
             if self.arm:
+                if not self.sdk_cartesian_supported:
+                    print("⚠ Cannot execute pick: SDK does not support cartesian move.")
+                    return False
                 if not self.move_to(x, y, approach_z):
                     return False
                 if not self.move_to(x, y, z):
