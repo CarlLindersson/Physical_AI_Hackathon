@@ -21,6 +21,7 @@ from pal.utilities.timing import QTimer
 SAMPLE_RATE_HZ = 5.0
 RUN_TIME_SECONDS = 300.0
 JOINT_SPEED_RAD_PER_SEC = np.pi / 4
+CENTER_MAX_SPEED_RAD_PER_SEC = np.pi / 10
 
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
@@ -44,6 +45,12 @@ ZONE_MAP = {
     "marker": "ZONE_D",
     "pen": "ZONE_D",
 }
+
+CENTER_TARGET_X_RATIO = 0.5
+DEFAULT_CENTER_TARGET_Y_RATIO = 0.5
+DEFAULT_CENTER_DEADBAND_PX = 30
+DEFAULT_CENTER_BASE_SIGN = -1.0
+DEFAULT_CENTER_SHOULDER_SIGN = 1.0
 
 
 def parse_args():
@@ -142,6 +149,36 @@ def parse_args():
         action="store_true",
         help="Do not display the annotated image returned by the Roboflow workflow.",
     )
+    parser.add_argument(
+        "--center-target-y-ratio",
+        type=float,
+        default=float(os.environ.get("CENTER_TARGET_Y_RATIO", str(DEFAULT_CENTER_TARGET_Y_RATIO))),
+        help="Auto-center target height in the image, 0.0 top to 1.0 bottom. Default: screen center.",
+    )
+    parser.add_argument(
+        "--center-deadband-px",
+        type=float,
+        default=float(os.environ.get("CENTER_DEADBAND_PX", str(DEFAULT_CENTER_DEADBAND_PX))),
+        help="Pixel error tolerated before auto-center moves the arm.",
+    )
+    parser.add_argument(
+        "--center-max-speed",
+        type=float,
+        default=float(os.environ.get("CENTER_MAX_SPEED_RAD_PER_SEC", str(CENTER_MAX_SPEED_RAD_PER_SEC))),
+        help="Maximum auto-center joint speed in rad/s.",
+    )
+    parser.add_argument(
+        "--center-base-sign",
+        type=float,
+        default=float(os.environ.get("CENTER_BASE_SIGN", str(DEFAULT_CENTER_BASE_SIGN))),
+        help="Flip this between 1 and -1 if horizontal auto-centering moves the wrong way.",
+    )
+    parser.add_argument(
+        "--center-shoulder-sign",
+        type=float,
+        default=float(os.environ.get("CENTER_SHOULDER_SIGN", str(DEFAULT_CENTER_SHOULDER_SIGN))),
+        help="Flip this between 1 and -1 if vertical auto-centering moves the wrong way.",
+    )
 
     args = parser.parse_args()
     if not args.roboflow_workflow_id and args.roboflow_model_id:
@@ -214,10 +251,13 @@ def print_controls(camera_index, camera_enabled):
         print("  Camera      disabled")
     print("  Up/Down     shoulder up/down")
     print("  Left/Right  base left/right")
+    print("  w/s         wrist up/down")
     print("  p           close gripper")
     print("  o           open gripper")
     print("  h           home position")
-    print("  s           show vision stats")
+    print("  c           toggle camera/object centering")
+    print("  n           center next detected target")
+    print("  t           show vision stats")
     print("  q or Esc    quit")
     print("\nClick/focus the pygame keyboard window before driving the arm.\n")
 
@@ -419,7 +459,7 @@ def draw_text(surface, font, text, pos, color=(190, 196, 205)):
     surface.blit(font.render(text, True, color), pos)
 
 
-def draw_camera_feed(screen, font, camera_surface, vision):
+def draw_camera_feed(screen, font, camera_surface, vision, center_target=None, selected_target_index=0):
     camera_rect = pygame.Rect(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT)
 
     if camera_surface is None:
@@ -437,14 +477,41 @@ def draw_camera_feed(screen, font, camera_surface, vision):
     screen.blit(camera_surface, camera_rect)
     pygame.draw.rect(screen, (70, 76, 86), camera_rect, 1)
     draw_text(screen, font, "LIVE CAMERA", (12, 12), (255, 255, 255))
+    if center_target is not None:
+        draw_center_target(screen, center_target)
     if vision:
-        draw_detection_overlays(screen, font, vision.detections)
+        draw_detection_overlays(screen, font, vision.detections, selected_target_index)
 
 
-def draw_keyboard_window(font, small_font, gripper_cmd, camera_surface, vision):
+def draw_center_target(screen, center_target):
+    x, y = center_target
+    color = (255, 255, 255)
+    pygame.draw.circle(screen, color, (int(x), int(y)), 16, 1)
+    pygame.draw.line(screen, color, (int(x) - 24, int(y)), (int(x) + 24, int(y)), 1)
+    pygame.draw.line(screen, color, (int(x), int(y) - 24), (int(x), int(y) + 24), 1)
+
+
+def draw_keyboard_window(
+    font,
+    small_font,
+    gripper_cmd,
+    camera_surface,
+    vision,
+    auto_center_enabled=False,
+    center_status="center off",
+    center_target=None,
+    selected_target_index=0,
+):
     screen = pygame.display.get_surface()
     screen.fill((20, 22, 26))
-    draw_camera_feed(screen, small_font, camera_surface, vision)
+    draw_camera_feed(
+        screen,
+        small_font,
+        camera_surface,
+        vision,
+        center_target if auto_center_enabled else None,
+        selected_target_index,
+    )
 
     panel_x = CAMERA_WIDTH + 22
     y = 18
@@ -460,17 +527,18 @@ def draw_keyboard_window(font, small_font, gripper_cmd, camera_surface, vision):
     )
     y += 38
 
-    for heading, items in (
-        ("Arrows", ("Base left/right", "Shoulder up/down")),
-        ("Gripper", ("p closes", "o opens")),
-        ("Other", ("h homes the arm", "q or Esc quits")),
+    draw_text(screen, font, "Controls", (panel_x, y), (240, 240, 240))
+    y += 26
+    for item in (
+        "Arrows move base/shoulder",
+        "w/s wrist, p/o gripper",
+        "h home, c center camera",
+        "n next center target",
+        "t stats, q/Esc quits",
     ):
-        draw_text(screen, font, heading, (panel_x, y), (240, 240, 240))
-        y += 26
-        for item in items:
-            draw_text(screen, small_font, item, (panel_x, y))
-            y += 22
-        y += 10
+        draw_text(screen, small_font, item, (panel_x, y))
+        y += 21
+    y += 8
 
     draw_text(screen, font, "Vision", (panel_x, y), (240, 240, 240))
     y += 26
@@ -478,17 +546,39 @@ def draw_keyboard_window(font, small_font, gripper_cmd, camera_surface, vision):
     y += 22
 
     if vision:
-        for line in vision.summary_lines():
+        for line in vision.summary_lines(max_lines=1):
             draw_text(screen, small_font, line, (panel_x, y))
             y += 22
+
+    y += 8
+    draw_text(screen, font, "Center", (panel_x, y), (240, 240, 240))
+    y += 26
+    center_color = (120, 220, 160) if auto_center_enabled else (190, 196, 205)
+    draw_text(screen, small_font, "on" if auto_center_enabled else "off", (panel_x, y), center_color)
+    y += 22
+    draw_text(screen, small_font, center_status, (panel_x, y))
+    y += 32
+
+    draw_text(screen, font, "Targets", (panel_x, y), (240, 240, 240))
+    y += 26
+    target_lines = target_list_lines(vision, selected_target_index, max_lines=3)
+    if not target_lines:
+        draw_text(screen, small_font, "No boxed targets", (panel_x, y))
+    else:
+        for line, is_selected in target_lines:
+            color = (255, 255, 255) if is_selected else (190, 196, 205)
+            draw_text(screen, small_font, line, (panel_x, y), color)
+            y += 21
 
     pygame.display.flip()
 
 
-def draw_detection_overlays(screen, font, detections):
-    for det in detections:
-        if det["box"] is None:
-            continue
+def draw_detection_overlays(screen, font, detections, selected_target_index=0):
+    targets = boxed_detections(detections)
+    selected_index = normalize_target_index(selected_target_index, targets)
+
+    for index, det in enumerate(targets):
+        is_selected = index == selected_index
 
         x1, y1, x2, y2 = det["box"]
         x1 = int(np.clip(x1, 0, CAMERA_WIDTH - 1))
@@ -498,11 +588,14 @@ def draw_detection_overlays(screen, font, detections):
         color = detection_color(det["class_id"])
         zone = det.get("zone")
         if zone:
-            label = f"{det['name']} {det['confidence']:.0%} -> {zone}"
+            label = f"#{index + 1} {det['name']} {det['confidence']:.0%} -> {zone}"
         else:
-            label = f"{det['name']} {det['confidence']:.0%}"
+            label = f"#{index + 1} {det['name']} {det['confidence']:.0%}"
 
-        pygame.draw.rect(screen, color, pygame.Rect(x1, y1, max(1, x2 - x1), max(1, y2 - y1)), 2)
+        rect = pygame.Rect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
+        pygame.draw.rect(screen, color, rect, 4 if is_selected else 2)
+        if is_selected:
+            pygame.draw.rect(screen, (255, 255, 255), rect.inflate(6, 6), 2)
         label_surface = font.render(label, True, (12, 14, 18))
         label_rect = label_surface.get_rect()
         label_rect.topleft = (x1, max(0, y1 - label_rect.height - 6))
@@ -513,6 +606,8 @@ def draw_detection_overlays(screen, font, detections):
 
 def handle_keydown_events(joint_cmd, gripper_cmd, vision=None):
     should_quit = False
+    toggle_auto_center = False
+    next_center_target = False
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -529,10 +624,14 @@ def handle_keydown_events(joint_cmd, gripper_cmd, vision=None):
             elif event.key == pygame.K_h:
                 joint_cmd[:] = QArmMini.HOME_POSE
                 print("Moving to home position")
-            elif event.key == pygame.K_s and vision is not None and hasattr(vision, "print_stats"):
+            elif event.key == pygame.K_c:
+                toggle_auto_center = True
+            elif event.key == pygame.K_n:
+                next_center_target = True
+            elif event.key == pygame.K_t and vision is not None and hasattr(vision, "print_stats"):
                 vision.print_stats()
 
-    return should_quit, gripper_cmd
+    return should_quit, gripper_cmd, toggle_auto_center, next_center_target
 
 
 def apply_arrow_key_motion(joint_cmd, timestep):
@@ -541,8 +640,114 @@ def apply_arrow_key_motion(joint_cmd, timestep):
 
     joint_cmd[0] += (int(keys[pygame.K_LEFT]) - int(keys[pygame.K_RIGHT])) * step
     joint_cmd[1] += (int(keys[pygame.K_UP]) - int(keys[pygame.K_DOWN])) * step
+    joint_cmd[3] += (int(keys[pygame.K_w]) - int(keys[pygame.K_s])) * step
 
     np.clip(joint_cmd, QArmMini.LIMITS_MIN, QArmMini.LIMITS_MAX, out=joint_cmd)
+
+
+def apply_auto_center_motion(joint_cmd, vision, timestep, args, selected_target_index):
+    detection, targets, target_index = selected_target_detection(vision, selected_target_index)
+    if detection is None:
+        return "waiting for targets", 0
+
+    box = detection["box"]
+    center_x = (box[0] + box[2]) / 2
+    center_y = (box[1] + box[3]) / 2
+    target_x, target_y = center_target(args)
+
+    error_x = center_x - target_x
+    error_y = center_y - target_y
+    move_x = 0.0 if abs(error_x) <= args.center_deadband_px else error_x
+    move_y = 0.0 if abs(error_y) <= args.center_deadband_px else error_y
+
+    if move_x == 0.0 and move_y == 0.0:
+        return f"#{target_index + 1}/{len(targets)} centered {short_text(detection['name'], 18)}", target_index
+
+    normalized_x = np.clip(move_x / (CAMERA_WIDTH / 2), -1.0, 1.0)
+    normalized_y = np.clip(move_y / (CAMERA_HEIGHT / 2), -1.0, 1.0)
+    max_step = args.center_max_speed * timestep
+
+    joint_cmd[0] += args.center_base_sign * normalized_x * max_step
+    joint_cmd[1] += args.center_shoulder_sign * normalized_y * max_step
+    np.clip(joint_cmd, QArmMini.LIMITS_MIN, QArmMini.LIMITS_MAX, out=joint_cmd)
+
+    name = short_text(detection["name"], 16)
+    return f"#{target_index + 1}/{len(targets)} {name}: dx {error_x:.0f}, dy {error_y:.0f}", target_index
+
+
+def select_next_target(vision, selected_target_index):
+    targets = target_detections(vision)
+    if not targets:
+        return 0, "no targets to select"
+
+    selected_target_index = normalize_target_index(selected_target_index, targets)
+    selected_target_index = (selected_target_index + 1) % len(targets)
+    detection = targets[selected_target_index]
+    return selected_target_index, selected_target_status(detection, targets, selected_target_index)
+
+
+def selected_target_detection(vision, selected_target_index):
+    targets = target_detections(vision)
+    if not targets:
+        return None, targets, 0
+
+    target_index = normalize_target_index(selected_target_index, targets)
+    return targets[target_index], targets, target_index
+
+
+def selected_target_status(detection, targets, target_index):
+    name = short_text(detection["name"], 18)
+    return f"#{target_index + 1}/{len(targets)} {name}"
+
+
+def target_detections(vision):
+    if vision is None:
+        return []
+    return boxed_detections(getattr(vision, "detections", []))
+
+
+def boxed_detections(detections):
+    return [
+        det
+        for det in (detections or [])
+        if isinstance(det, dict) and det.get("box") is not None
+    ]
+
+
+def normalize_target_index(selected_target_index, targets):
+    if not targets:
+        return 0
+    return selected_target_index % len(targets)
+
+
+def target_list_lines(vision, selected_target_index, max_lines=4):
+    targets = target_detections(vision)
+    if not targets:
+        return []
+
+    selected_index = normalize_target_index(selected_target_index, targets)
+    indexes = list(range(min(max_lines, len(targets))))
+    if selected_index not in indexes:
+        indexes[-1] = selected_index
+
+    lines = []
+    for index in indexes:
+        det = targets[index]
+        marker = ">" if index == selected_index else " "
+        zone = det.get("zone", "")
+        zone_text = f" -> {zone}" if zone else ""
+        lines.append(
+            (
+                f"{marker}#{index + 1} {short_text(det['name'], 14)} {det['confidence']:.0%}{zone_text}",
+                index == selected_index,
+            )
+        )
+    return lines
+
+
+def center_target(args):
+    target_y_ratio = float(np.clip(args.center_target_y_ratio, 0.0, 1.0))
+    return CAMERA_WIDTH * CENTER_TARGET_X_RATIO, CAMERA_HEIGHT * target_y_ratio
 
 
 class InactiveVision:
@@ -1002,14 +1207,45 @@ def main():
     joint_cmd = QArmMini.HOME_POSE.copy()
     gripper_cmd = GRIPPER_OPEN
     frame_number = 0
+    auto_center_enabled = False
+    center_status = "center off"
+    selected_target_index = 0
 
     try:
         while timer.check():
-            should_quit, gripper_cmd = handle_keydown_events(joint_cmd, gripper_cmd, vision)
+            should_quit, gripper_cmd, toggle_auto_center, next_center_target = handle_keydown_events(
+                joint_cmd,
+                gripper_cmd,
+                vision,
+            )
             if should_quit:
                 break
+            if toggle_auto_center:
+                auto_center_enabled = not auto_center_enabled
+                if auto_center_enabled:
+                    selected_target_index = 0
+                    detection, targets, target_index = selected_target_detection(vision, selected_target_index)
+                    center_status = (
+                        selected_target_status(detection, targets, target_index)
+                        if detection is not None
+                        else "waiting for targets"
+                    )
+                else:
+                    center_status = "center off"
+                print(f"Camera centering: {'on' if auto_center_enabled else 'off'}")
+            if next_center_target:
+                selected_target_index, center_status = select_next_target(vision, selected_target_index)
+                print(f"Center target: {center_status}")
 
             apply_arrow_key_motion(joint_cmd, timer.get_sample_time())
+            if auto_center_enabled:
+                center_status, selected_target_index = apply_auto_center_motion(
+                    joint_cmd,
+                    vision,
+                    timer.get_sample_time(),
+                    args,
+                    selected_target_index,
+                )
             myMiniArm.read_write_std(joint_cmd, gripper_cmd)
 
             frame = read_camera_frame(cap)
@@ -1018,7 +1254,17 @@ def main():
                 if vision is not None:
                     frame = vision.annotate(frame, frame_number)
 
-            draw_keyboard_window(font, small_font, gripper_cmd, frame_to_surface(frame), vision)
+            draw_keyboard_window(
+                font,
+                small_font,
+                gripper_cmd,
+                frame_to_surface(frame),
+                vision,
+                auto_center_enabled,
+                center_status,
+                center_target(args),
+                selected_target_index,
+            )
 
             timer.sleep()
 
