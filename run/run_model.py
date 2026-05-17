@@ -3,9 +3,12 @@
 #-----------------------------------------------------------------------------#
 
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 import os
 from pathlib import Path
+import time
 
 import cv2
 import numpy as np
@@ -28,11 +31,30 @@ WINDOW_HEIGHT = CAMERA_HEIGHT
 GRIPPER_OPEN = 0.0
 GRIPPER_CLOSED = 1.0
 
+DEFAULT_ROBOFLOW_WORKSPACE = "eshitas-workspace-gas5f"
+DEFAULT_ROBOFLOW_WORKFLOW_ID = "qarm-trash-ensemble-detection-1779037824337"
+DEFAULT_ROBOFLOW_FALLBACK_WORKFLOW_ID = "qarm-trash-detection-1779035433585"
+
+ZONE_MAP = {
+    "plastic bottles": "ZONE_A",
+    "paper cup": "ZONE_B",
+    "metal cans": "ZONE_C",
+    "paper crumble": "ZONE_B",
+    "paper box": "ZONE_B",
+    "marker": "ZONE_D",
+    "pen": "ZONE_D",
+}
+
 
 def parse_args():
     load_local_env()
     parser = argparse.ArgumentParser(description="QArm Mini keyboard control with live camera feed.")
-    parser.add_argument("--camera-index", type=int, default=1, help="OpenCV camera index to use.")
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=int(os.environ.get("CAMERA_INDEX", "1")),
+        help="OpenCV camera index to use. Defaults to CAMERA_INDEX or 1.",
+    )
     parser.add_argument("--no-camera", action="store_true", help="Run keyboard control without opening a camera.")
     parser.add_argument(
         "--vision-backend",
@@ -73,13 +95,18 @@ def parse_args():
     )
     parser.add_argument(
         "--roboflow-workspace-name",
-        default=os.environ.get("ROBOFLOW_WORKSPACE_NAME"),
+        default=os.environ.get("ROBOFLOW_WORKSPACE_NAME", DEFAULT_ROBOFLOW_WORKSPACE),
         help="Roboflow workspace name for run_workflow. Defaults to ROBOFLOW_WORKSPACE_NAME.",
     )
     parser.add_argument(
         "--roboflow-workflow-id",
-        default=os.environ.get("ROBOFLOW_WORKFLOW_ID"),
+        default=os.environ.get("ROBOFLOW_WORKFLOW_ID", DEFAULT_ROBOFLOW_WORKFLOW_ID),
         help="Roboflow workflow ID for run_workflow. Defaults to ROBOFLOW_WORKFLOW_ID.",
+    )
+    parser.add_argument(
+        "--roboflow-fallback-workflow-id",
+        default=os.environ.get("ROBOFLOW_FALLBACK_WORKFLOW_ID", DEFAULT_ROBOFLOW_FALLBACK_WORKFLOW_ID),
+        help="Optional fallback workflow ID if the primary workflow request fails.",
     )
     parser.add_argument(
         "--roboflow-image-key",
@@ -89,13 +116,13 @@ def parse_args():
     parser.add_argument(
         "--roboflow-confidence",
         type=float,
-        default=0.4,
-        help="Roboflow confidence threshold from 0.0 to 1.0.",
+        default=float(os.environ.get("ROBOFLOW_CONFIDENCE", "0.0")),
+        help="Client-side Roboflow confidence threshold from 0.0 to 1.0.",
     )
     parser.add_argument(
         "--roboflow-every-n-frames",
         type=int,
-        default=8,
+        default=int(os.environ.get("ROBOFLOW_EVERY_N_FRAMES", "1")),
         help="Submit every Nth camera frame to Roboflow and reuse the last detections between requests.",
     )
     parser.add_argument(
@@ -109,6 +136,11 @@ def parse_args():
         action="store_true",
         default=not parse_bool_env(os.environ.get("ROBOFLOW_USE_CACHE"), True),
         help="Disable Roboflow workflow caching.",
+    )
+    parser.add_argument(
+        "--no-roboflow-annotated-image",
+        action="store_true",
+        help="Do not display the annotated image returned by the Roboflow workflow.",
     )
 
     args = parser.parse_args()
@@ -185,6 +217,7 @@ def print_controls(camera_index, camera_enabled):
     print("  p           close gripper")
     print("  o           open gripper")
     print("  h           home position")
+    print("  s           show vision stats")
     print("  q or Esc    quit")
     print("\nClick/focus the pygame keyboard window before driving the arm.\n")
 
@@ -247,26 +280,19 @@ def load_roboflow(args):
         print(f"Warning: could not configure Roboflow client: {exc}")
         return InactiveVision("roboflow config error", [short_text(exc)])
 
-    try:
-        from inference_sdk import InferenceConfiguration
-
-        client.configure(
-            InferenceConfiguration(confidence_threshold=args.roboflow_confidence)
-        )
-    except Exception as exc:
-        print(f"Warning: could not set Roboflow confidence on the client: {exc}")
-        print("         Predictions will still be filtered locally.")
-
     print(
         "Roboflow workflow configured: "
         f"{args.roboflow_workspace_name}/{args.roboflow_workflow_id}"
     )
+    print(f"Roboflow API URL: {args.roboflow_api_url}")
     return RoboflowClassifier(
         client=client,
         workspace_name=args.roboflow_workspace_name,
         workflow_id=args.roboflow_workflow_id,
+        fallback_workflow_id=args.roboflow_fallback_workflow_id,
         image_key=args.roboflow_image_key,
         use_cache=not args.no_roboflow_cache,
+        use_annotated_image=not args.no_roboflow_annotated_image,
         class_filter=args.roboflow_classes,
         confidence=args.roboflow_confidence,
         every_n_frames=max(1, args.roboflow_every_n_frames),
@@ -470,7 +496,11 @@ def draw_detection_overlays(screen, font, detections):
         x2 = int(np.clip(x2, 0, CAMERA_WIDTH - 1))
         y2 = int(np.clip(y2, 0, CAMERA_HEIGHT - 1))
         color = detection_color(det["class_id"])
-        label = f"{det['name']} {det['confidence']:.0%}"
+        zone = det.get("zone")
+        if zone:
+            label = f"{det['name']} {det['confidence']:.0%} -> {zone}"
+        else:
+            label = f"{det['name']} {det['confidence']:.0%}"
 
         pygame.draw.rect(screen, color, pygame.Rect(x1, y1, max(1, x2 - x1), max(1, y2 - y1)), 2)
         label_surface = font.render(label, True, (12, 14, 18))
@@ -481,7 +511,7 @@ def draw_detection_overlays(screen, font, detections):
         screen.blit(label_surface, label_rect)
 
 
-def handle_keydown_events(joint_cmd, gripper_cmd):
+def handle_keydown_events(joint_cmd, gripper_cmd, vision=None):
     should_quit = False
 
     for event in pygame.event.get():
@@ -499,6 +529,8 @@ def handle_keydown_events(joint_cmd, gripper_cmd):
             elif event.key == pygame.K_h:
                 joint_cmd[:] = QArmMini.HOME_POSE
                 print("Moving to home position")
+            elif event.key == pygame.K_s and vision is not None and hasattr(vision, "print_stats"):
+                vision.print_stats()
 
     return should_quit, gripper_cmd
 
@@ -614,8 +646,10 @@ class RoboflowClassifier:
         client,
         workspace_name,
         workflow_id,
+        fallback_workflow_id,
         image_key,
         use_cache,
+        use_annotated_image,
         class_filter,
         confidence,
         every_n_frames,
@@ -623,8 +657,10 @@ class RoboflowClassifier:
         self.client = client
         self.workspace_name = workspace_name
         self.workflow_id = workflow_id
+        self.fallback_workflow_id = fallback_workflow_id
         self.image_key = image_key
         self.use_cache = use_cache
+        self.use_annotated_image = use_annotated_image
         self.class_filter = set(class_filter) if class_filter else None
         self.confidence = confidence
         self.every_n_frames = every_n_frames
@@ -633,21 +669,25 @@ class RoboflowClassifier:
         self.detections = []
         self.status = "roboflow workflow ready"
         self.last_error = None
+        self.last_detection = None
+        self.last_annotated_frame = None
+        self.frame_count = 0
+        self.detection_count = 0
+        self.start_time = time.time()
 
     def annotate(self, frame, frame_number):
         self._collect_finished_request()
+        self.frame_count += 1
 
         if self.future is None and frame_number % self.every_n_frames == 0:
-            image = Image.fromarray(np.ascontiguousarray(frame[:, :, ::-1]))
             self.future = self.executor.submit(
-                self.client.run_workflow,
-                workspace_name=self.workspace_name,
-                workflow_id=self.workflow_id,
-                images={self.image_key: image},
-                use_cache=self.use_cache,
+                self._run_workflow_request,
+                np.ascontiguousarray(frame.copy()),
             )
             self.status = "roboflow workflow request..."
 
+        if self.use_annotated_image and self.last_annotated_frame is not None:
+            return self.last_annotated_frame
         return frame
 
     def summary_lines(self, max_lines=3):
@@ -656,25 +696,48 @@ class RoboflowClassifier:
         if not self.detections:
             return ["No objects"]
 
-        return [
-            f"{det['name']} {det['confidence']:.0%}"
-            for det in self.detections[:max_lines]
-        ]
+        lines = []
+        for det in self.detections[:max_lines]:
+            zone = det.get("zone", "ZONE_D")
+            lines.append(f"{det['name']} {det['confidence']:.0%} -> {zone}")
+        return lines
 
     def shutdown(self):
         self.executor.shutdown(wait=False, cancel_futures=True)
+
+    def print_stats(self):
+        elapsed = time.time() - self.start_time
+        fps = self.frame_count / elapsed if elapsed > 0 else 0.0
+        print("\n=== ROBOFLOW STATISTICS ===")
+        print(f"Frames seen: {self.frame_count}")
+        print(f"Detections: {self.detection_count}")
+        print(f"Workflow FPS: {fps:.1f}")
+        print(f"Workflow: {self.workspace_name}/{self.workflow_id}")
+        if self.fallback_workflow_id and self.fallback_workflow_id != self.workflow_id:
+            print(f"Fallback workflow: {self.fallback_workflow_id}")
+        if self.last_detection:
+            print(
+                "Last detected: "
+                f"{self.last_detection['name']} -> {self.last_detection['zone']}"
+            )
 
     def _collect_finished_request(self):
         if self.future is None or not self.future.done():
             return
 
         try:
-            result = self.future.result()
-            self.detections = self._extract_detections(result)
+            result, workflow_id = self.future.result()
+            output, predictions = self._parse_workflow_result(result)
+            self.detections = self._predictions_to_detections(predictions)
+            self.detection_count += len(self.detections)
             self.last_error = None
+            self.last_annotated_frame = self._decode_annotated_frame(output)
             object_count = len(self.detections)
             noun = "object" if object_count == 1 else "objects"
             self.status = f"roboflow workflow {object_count} {noun}"
+            if self.detections:
+                self.last_detection = self.detections[0]
+                self._print_detections()
         except Exception as exc:
             self.status = "roboflow workflow error"
             self.last_error = short_text(exc)
@@ -682,11 +745,91 @@ class RoboflowClassifier:
         finally:
             self.future = None
 
-    def _extract_detections(self, result):
+    def _run_workflow_request(self, frame):
+        try:
+            result = self.client.run_workflow(
+                workspace_name=self.workspace_name,
+                workflow_id=self.workflow_id,
+                images={self.image_key: frame},
+                use_cache=self.use_cache,
+            )
+            return result, self.workflow_id
+        except Exception as exc:
+            if not self.fallback_workflow_id or self.fallback_workflow_id == self.workflow_id:
+                raise
+
+            print(
+                "Warning: primary Roboflow workflow failed; trying fallback "
+                f"{self.fallback_workflow_id}. Primary error: {short_text(exc, 120)}"
+            )
+            result = self.client.run_workflow(
+                workspace_name=self.workspace_name,
+                workflow_id=self.fallback_workflow_id,
+                images={self.image_key: frame},
+                use_cache=self.use_cache,
+            )
+            return result, self.fallback_workflow_id
+
+    def _parse_workflow_result(self, result):
+        try:
+            output = result[0]
+            predictions = output.get("predictions", {}).get("predictions", [])
+        except (IndexError, KeyError, TypeError, AttributeError) as exc:
+            raise ValueError(f"Could not parse Roboflow workflow output: {exc}") from exc
+
+        if not isinstance(predictions, list):
+            predictions = []
+
+        return output, predictions
+
+    def _predictions_to_detections(self, predictions):
         detections = []
-        self._collect_detections(result, detections)
+        for prediction in predictions:
+            if not isinstance(prediction, dict):
+                continue
+            detection = self._prediction_to_detection(prediction)
+            if detection is not None:
+                detections.append(detection)
         detections.sort(key=lambda det: det["confidence"], reverse=True)
         return detections
+
+    def _decode_annotated_frame(self, output):
+        if not self.use_annotated_image or not isinstance(output, dict):
+            return None
+
+        encoded = output.get("annotated_image")
+        if not encoded:
+            return None
+
+        try:
+            image = Image.open(BytesIO(base64.b64decode(encoded))).convert("RGB")
+            frame = np.ascontiguousarray(np.asarray(image)[:, :, ::-1])
+            if frame.shape[:2] != (CAMERA_HEIGHT, CAMERA_WIDTH):
+                frame = resize_image(frame, (CAMERA_WIDTH, CAMERA_HEIGHT))
+            return frame
+        except Exception as exc:
+            print(f"Warning: could not decode Roboflow annotated image: {exc}")
+            return None
+
+    def _print_detections(self):
+        print(f"\n[Roboflow frame {self.frame_count}] {len(self.detections)} object(s) detected:")
+        for index, det in enumerate(self.detections, start=1):
+            box = det.get("box")
+            if box is None:
+                center = "(n/a,n/a)"
+            else:
+                x1, y1, x2, y2 = box
+                center = f"({(x1 + x2) / 2:.0f},{(y1 + y2) / 2:.0f})"
+            print(
+                f"  {index}. {det['name']} ({det['confidence']:.2f}) "
+                f"at {center} -> {det['zone']}"
+            )
+
+        best = self.detections[0]
+        print(
+            f"  NEXT PICK: {best['name']} ({best['confidence']:.2f}) "
+            f"-> {best['zone']}"
+        )
 
     def _collect_detections(self, value, detections, parent_key=None):
         if isinstance(value, list):
@@ -729,11 +872,13 @@ class RoboflowClassifier:
         if confidence < self.confidence:
             return None
 
+        zone = ZONE_MAP.get(name, "ZONE_D")
         return {
             "box": self._prediction_box(prediction),
-            "class_id": stable_class_id(name),
+            "class_id": self._prediction_class_id(prediction, name),
             "name": name,
             "confidence": confidence,
+            "zone": zone,
         }
 
     def _extract_classification_predictions(self, predictions):
@@ -759,6 +904,7 @@ class RoboflowClassifier:
                     "class_id": stable_class_id(name),
                     "name": name,
                     "confidence": confidence,
+                    "zone": ZONE_MAP.get(name, "ZONE_D"),
                 }
             )
 
@@ -782,6 +928,12 @@ class RoboflowClassifier:
             if key in prediction:
                 return self._to_float(prediction[key])
         return None
+
+    def _prediction_class_id(self, prediction, name):
+        class_id = self._to_float(prediction.get("class_id"))
+        if class_id is None:
+            return stable_class_id(name)
+        return int(class_id)
 
     @staticmethod
     def _to_float(value):
@@ -853,7 +1005,7 @@ def main():
 
     try:
         while timer.check():
-            should_quit, gripper_cmd = handle_keydown_events(joint_cmd, gripper_cmd)
+            should_quit, gripper_cmd = handle_keydown_events(joint_cmd, gripper_cmd, vision)
             if should_quit:
                 break
 
