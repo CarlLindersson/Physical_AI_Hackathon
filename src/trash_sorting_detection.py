@@ -40,10 +40,20 @@ ROBOFLOW_WORKFLOW_ID = os.getenv("ROBOFLOW_WORKFLOW_ID", "qarm-trash-ensemble-de
 QARM_SERIAL_PORT = os.getenv("QARM_SERIAL_PORT", "/dev/ttyUSB0")
 QARM_BAUD = int(os.getenv("QARM_BAUD_RATE", "115200"))
 USE_ROBOT = os.getenv("USE_ROBOT", "true").lower() == "true"
+USE_SDK = os.getenv("USE_SDK", "true").lower() == "true"
 
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 FRAME_WIDTH = int(os.getenv("CAMERA_WIDTH", "640"))
 FRAME_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "480"))
+
+# Calibration: map image pixels to robot workspace coordinates
+CAMERA_X_OFFSET = float(os.getenv("CAMERA_X_OFFSET", "0.0"))
+CAMERA_Y_OFFSET = float(os.getenv("CAMERA_Y_OFFSET", "0.0"))
+PIXEL_TO_METER_X = float(os.getenv("PIXEL_TO_METER_X", "0.001"))
+PIXEL_TO_METER_Y = float(os.getenv("PIXEL_TO_METER_Y", "0.001"))
+PICK_Z = float(os.getenv("PICK_Z", "0.05"))
+APPROACH_Z = float(os.getenv("APPROACH_Z", "0.10"))
+LIFT_Z = float(os.getenv("LIFT_Z", "0.15"))
 
 # Zone mapping: object class -> drop zone
 ZONE_MAP = {
@@ -64,6 +74,18 @@ ZONE_COORDS = {
     "ZONE_D": {"x": 0.0, "y": 0.0, "z": -0.1},  # Discard
 }
 
+OBJECT_PICK_PARAMS = {
+    "paper cup": {"grip_strength": 0.35, "pick_z": 0.05, "priority": 0.4},
+    "plastic bottles": {"grip_strength": 0.45, "pick_z": 0.06, "priority": 0.5},
+    "metal cans": {"grip_strength": 0.80, "pick_z": 0.05, "priority": 0.9},
+    "paper crumble": {"grip_strength": 0.30, "pick_z": 0.05, "priority": 0.3},
+    "paper box": {"grip_strength": 0.40, "pick_z": 0.05, "priority": 0.6},
+    "marker": {"grip_strength": 0.30, "pick_z": 0.04, "priority": 0.2},
+    "pen": {"grip_strength": 0.30, "pick_z": 0.04, "priority": 0.2},
+}
+
+DEFAULT_OBJECT_PICK_PARAMS = {"grip_strength": 0.5, "pick_z": 0.055, "priority": 0.7}
+
 
 class TrashSortingDemo:
     """Live trash detection and sorting with Roboflow + QArmMini"""
@@ -83,12 +105,13 @@ class TrashSortingDemo:
         # Initialize robot
         self.robot = None
         if USE_ROBOT:
-            self.robot = QArmMiniRobot(port=QARM_SERIAL_PORT, baud=QARM_BAUD, use_sdk=False)
+            self.robot = QArmMiniRobot(port=QARM_SERIAL_PORT, baud=QARM_BAUD, use_sdk=USE_SDK)
         
         self.frame_count = 0
         self.detection_count = 0
         self.start_time = time.time()
         self.last_detection = None
+        self.detected_objects = []
         
         print("="*60)
         print("QArmMini Trash Sorting - Live Detection")
@@ -103,7 +126,8 @@ class TrashSortingDemo:
         print("\nControls:")
         print("  q - Quit")
         print("  s - Show stats")
-        print("  p - Pick (auto-execute last detection)")
+        print("  p - Pick current object")
+        print("  a - Auto pick all visible objects")
         print("  h - Home position")
         print("="*60 + "\n")
     
@@ -176,13 +200,16 @@ class TrashSortingDemo:
             object_count = output.get("object_count", 0)
         except (IndexError, KeyError, TypeError) as e:
             print(f"Parse error: {e}")
+            self.detected_objects = []
             return frame, None
         
+        self.detected_objects = []
         if predictions:
             self.detection_count += len(predictions)
             
             # Sort by confidence
             sorted_preds = sorted(predictions, key=lambda p: p.get("confidence", 0), reverse=True)
+            self.detected_objects = sorted_preds
             
             # Print detections
             print(f"\n[Frame {self.frame_count}] {len(predictions)} object(s) detected:")
@@ -228,6 +255,93 @@ class TrashSortingDemo:
         
         return frame, None
     
+    def pixel_to_world(self, x: float, y: float, frame_width: int, frame_height: int):
+        """Convert pixel coordinates to robot workspace coordinates."""
+        dx = x - frame_width / 2.0
+        dy = y - frame_height / 2.0
+        world_x = CAMERA_X_OFFSET + dx * PIXEL_TO_METER_X
+        world_y = CAMERA_Y_OFFSET + dy * PIXEL_TO_METER_Y
+        return world_x, world_y
+
+    def get_pick_params(self, obj_class: str):
+        params = OBJECT_PICK_PARAMS.get(obj_class, DEFAULT_OBJECT_PICK_PARAMS)
+        return params["grip_strength"], params["pick_z"], params["priority"]
+
+    def sort_objects_for_pick(self, detections):
+        """Sort detections by a simple ease+distance score."""
+        world_centers = []
+        for det in detections:
+            x = det.get("x", FRAME_WIDTH / 2)
+            y = det.get("y", FRAME_HEIGHT / 2)
+            wx, wy = self.pixel_to_world(x, y, FRAME_WIDTH, FRAME_HEIGHT)
+            _, _, priority = self.get_pick_params(det.get("class", "unknown"))
+            distance = (wx ** 2 + wy ** 2) ** 0.5
+            score = distance + priority
+            world_centers.append((score, det, wx, wy))
+
+        world_centers.sort(key=lambda item: item[0])
+        return world_centers
+
+    def do_robot_pick(self, det: dict) -> bool:
+        """Pick a single detected object using robot motion sequence."""
+        if not self.robot:
+            print("⚠ No robot attached")
+            return False
+
+        object_x, object_y = self.pixel_to_world(det["x"], det["y"], FRAME_WIDTH, FRAME_HEIGHT)
+        grip_strength, pick_z, _ = self.get_pick_params(det.get("class", "unknown"))
+        zone_coords = ZONE_COORDS.get(det["zone"], {"x": 0.0, "y": 0.0, "z": PICK_Z})
+
+        print(f"\n[ROBOT] object class={det['class']} pixel=({det['x']:.0f},{det['y']:.0f}) world=({object_x:.3f},{object_y:.3f},{pick_z:.3f}) grip={grip_strength:.2f}")
+        print(f"[ROBOT] placing into {det['zone']} at ({zone_coords['x']:.3f},{zone_coords['y']:.3f},{zone_coords['z']:.3f})")
+
+        success = self.robot.pick_and_place(
+            x=object_x,
+            y=object_y,
+            z=pick_z,
+            zone=det["zone"],
+            zone_coords=zone_coords,
+            grip_strength=grip_strength,
+            return_home=True
+        )
+        return success
+
+    def execute_pick_sequence(self):
+        """Auto pick visible objects one by one."""
+        if not self.robot:
+            print("⚠ Robot not connected")
+            return
+
+        print("\n→ STARTING AUTO PICK SEQUENCE")
+        ret, frame = self.cap.read()
+        if not ret:
+            print("Failed to read frame for auto sequence")
+            return
+
+        frame, _ = self.process_frame(frame)
+        if not self.detected_objects:
+            print("No objects detected in frame. Auto sequence complete.")
+            return
+
+        objects = self.sort_objects_for_pick(self.detected_objects)
+        for round_idx, (score, det, wx, wy) in enumerate(objects, start=1):
+            print(f"\nRound {round_idx}: picking {det['class']} ({det['confidence']:.2f}) → {det['zone']} score={score:.2f}")
+            if not self.do_robot_pick(det):
+                print("Failed to complete pick. Aborting auto sequence.")
+                break
+
+            print("Pick complete. Re-acquiring scene for next object...")
+            time.sleep(1.0)
+            ret, frame = self.cap.read()
+            if not ret:
+                print("Failed to read frame after pick")
+                break
+            frame, _ = self.process_frame(frame)
+            if not self.detected_objects:
+                print("No remaining objects detected. Sequence finished.")
+                break
+        print("Auto pick sequence finished")
+
     def draw_ui(self, frame):
         """Draw status UI on frame"""
         elapsed = time.time() - self.start_time
@@ -275,6 +389,8 @@ class TrashSortingDemo:
                     self.print_stats()
                 elif key == ord('p'):
                     self.execute_pick()
+                elif key == ord('a'):
+                    self.execute_pick_sequence()
                 elif key == ord('h'):
                     self.execute_home()
         
@@ -296,16 +412,7 @@ class TrashSortingDemo:
         
         det = self.last_detection
         print(f"\n→ EXECUTING PICK: {det['class']} to {det['zone']}")
-        
-        # Get zone coordinates (or use pixel-to-coord conversion)
-        zone_coords = ZONE_COORDS.get(det['zone'], {"x": 0, "y": 0, "z": 0.1})
-        
-        self.robot.pick_and_place(
-            x=zone_coords['x'],
-            y=zone_coords['y'],
-            z=zone_coords['z'],
-            zone=det['zone']
-        )
+        self.do_robot_pick(det)
     
     def execute_home(self):
         """Move robot to home position"""

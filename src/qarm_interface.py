@@ -9,6 +9,9 @@ import serial
 import time
 from typing import Optional, Dict
 
+GRIPPER_OPEN = 0.0
+GRIPPER_CLOSED = 1.0
+
 
 class QArmMiniRobot:
     """
@@ -31,17 +34,24 @@ class QArmMiniRobot:
         self.use_sdk = use_sdk
         self.arm = None
         self.ser = None
+        self.joint_cmd = None
+        self.gripper_cmd = GRIPPER_OPEN
         
         # Try Quanser SDK first if requested
         if use_sdk:
             try:
                 from pal.products.qarm_mini import QArmMini
-                print("✓ Using Quanser SDK")
-                self.arm = QArmMini()
+                print("✓ Using Quanser QArm Mini SDK")
+                self.arm = QArmMini(hardware=1, id=3)
+                self.joint_cmd = self.arm.HOME_POSE.copy()
+                self.gripper_cmd = GRIPPER_OPEN
                 self.connected = True
                 return
             except ImportError:
                 print("⚠ Quanser SDK not available, falling back to serial")
+            except Exception as e:
+                print(f"⚠ Quanser SDK initialization failed: {e}")
+                print("  Falling back to serial")
         
         # Fall back to serial connection
         try:
@@ -54,7 +64,59 @@ class QArmMiniRobot:
             print(f"  Make sure robot is connected to {port}")
             self.connected = False
     
-    def pick_and_place(self, x: float, y: float, z: float, zone: str) -> bool:
+    def send_command(self, cmd: str) -> str:
+        """Send a single command string to the robot."""
+        if not self.connected:
+            return ""
+
+        try:
+            if self.arm:
+                if hasattr(self.arm, "send_command"):
+                    response = self.arm.send_command(cmd)
+                    print(f"[SDK CMD] {cmd} → {response}")
+                    return response
+                print(f"[SDK CMD] {cmd}")
+                return "OK"
+            self.ser.write(cmd.encode() + b'\r\n')
+            response = self.ser.readline().decode().strip()
+            return response
+        except Exception as e:
+            print(f"Serial error: {e}")
+            return ""
+
+    def move_to(self, x: float, y: float, z: float) -> bool:
+        """Move the robot end effector to an absolute XYZ pose."""
+        if not self.connected:
+            return False
+
+        if self.arm:
+            if hasattr(self.arm, "move_cartesian"):
+                self.arm.move_cartesian(x, y, z)
+                return True
+            if hasattr(self.arm, "move_to"):
+                self.arm.move_to(x, y, z)
+                return True
+            print("⚠ SDK does not expose a cartesian move method")
+            return False
+
+        cmd = f"MOVE {x:.3f} {y:.3f} {z:.3f}"
+        response = self.send_command(cmd)
+        print(f"[ROBOT CMD] {cmd} → {response}")
+        time.sleep(0.5)
+        return True
+
+    def pick_and_place(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        zone: str,
+        zone_coords: Optional[Dict[str, float]] = None,
+        grip_strength: float = GRIPPER_CLOSED,
+        approach_offset: float = 0.08,
+        lift_offset: float = 0.12,
+        return_home: bool = True,
+    ) -> bool:
         """
         Send pick and place command to robot
         
@@ -67,20 +129,42 @@ class QArmMiniRobot:
         """
         if not self.connected:
             return False
-        
+
+        zone_coords = zone_coords or {"x": 0.0, "y": 0.0, "z": z}
+        approach_z = z + approach_offset
+        lift_z = z + lift_offset
+        deposit_z = zone_coords.get("z", z)
+        deposit_approach_z = deposit_z + approach_offset
+
         try:
             if self.arm:
-                # Quanser SDK command
-                # TODO: implement based on actual SDK
-                print(f"[ROBOT CMD] Pick from ({x:.2f}, {y:.2f}, {z:.2f}) → {zone}")
+                if not self.move_to(x, y, approach_z):
+                    return False
+                if not self.move_to(x, y, z):
+                    return False
+                self.gripper_close(grip_strength)
+                if not self.move_to(x, y, lift_z):
+                    return False
+                if not self.move_to(zone_coords["x"], zone_coords["y"], deposit_approach_z):
+                    return False
+                if not self.move_to(zone_coords["x"], zone_coords["y"], deposit_z):
+                    return False
+                self.gripper_open()
+                if return_home:
+                    self.home()
                 return True
-            else:
-                # Serial command format (customize for your robot)
-                cmd = f"PICK {x:.3f} {y:.3f} {z:.3f} {zone}\r\n"
-                self.ser.write(cmd.encode())
-                response = self.ser.readline().decode().strip()
-                print(f"[ROBOT CMD] {cmd.strip()} → {response}")
-                return True
+
+            self.move_to(x, y, approach_z)
+            self.move_to(x, y, z)
+            self.gripper_close(grip_strength)
+            self.move_to(x, y, lift_z)
+            self.move_to(zone_coords['x'], zone_coords['y'], deposit_approach_z)
+            self.move_to(zone_coords['x'], zone_coords['y'], deposit_z)
+            self.gripper_open()
+            self.move_to(zone_coords['x'], zone_coords['y'], deposit_approach_z)
+            if return_home:
+                self.home()
+            return True
         except Exception as e:
             print(f"Robot command error: {e}")
             return False
@@ -92,13 +176,19 @@ class QArmMiniRobot:
         
         try:
             if self.arm:
-                # Quanser SDK home
-                print("[ROBOT CMD] HOME")
+                if hasattr(self.arm, "read_write_std") and self.joint_cmd is not None:
+                    self.joint_cmd = self.arm.HOME_POSE.copy()
+                    self.arm.read_write_std(self.joint_cmd, self.gripper_cmd)
+                    print("[SDK CMD] HOME")
+                    return True
+                if hasattr(self.arm, "home"):
+                    self.arm.home()
+                    print("[SDK CMD] HOME")
+                    return True
+                print("[SDK CMD] HOME")
                 return True
             else:
-                # Serial home command
-                self.ser.write(b"HOME\r\n")
-                response = self.ser.readline().decode().strip()
+                response = self.send_command("HOME")
                 print(f"[ROBOT CMD] HOME → {response}")
                 return True
         except Exception as e:
@@ -106,37 +196,53 @@ class QArmMiniRobot:
             return False
     
     def gripper_open(self) -> bool:
-        """Open gripper"""
+        """Open gripper."""
         if not self.connected:
             return False
-        
+
         try:
+            self.gripper_cmd = GRIPPER_OPEN
             if self.arm:
-                print("[ROBOT CMD] GRIPPER OPEN")
+                if hasattr(self.arm, "read_write_std"):
+                    self.arm.read_write_std(self.joint_cmd, self.gripper_cmd)
+                    print(f"[SDK CMD] GRIP OPEN ({self.gripper_cmd:.2f})")
+                    return True
+                if hasattr(self.arm, "set_gripper"):
+                    self.arm.set_gripper(self.gripper_cmd)
+                    print(f"[SDK CMD] GRIP OPEN ({self.gripper_cmd:.2f})")
+                    return True
+                print("[SDK CMD] GRIP OPEN")
                 return True
-            else:
-                self.ser.write(b"GRIP OPEN\r\n")
-                response = self.ser.readline().decode().strip()
-                print(f"[ROBOT CMD] GRIPPER OPEN → {response}")
-                return True
+
+            response = self.send_command("GRIP OPEN")
+            print(f"[ROBOT CMD] GRIPPER OPEN → {response}")
+            return True
         except Exception as e:
             print(f"Gripper error: {e}")
             return False
-    
-    def gripper_close(self) -> bool:
-        """Close gripper"""
+
+    def gripper_close(self, strength: float = GRIPPER_CLOSED) -> bool:
+        """Close gripper with optional strength."""
         if not self.connected:
             return False
-        
+
+        self.gripper_cmd = min(max(strength, 0.0), 1.0)
         try:
             if self.arm:
-                print("[ROBOT CMD] GRIPPER CLOSE")
+                if hasattr(self.arm, "read_write_std"):
+                    self.arm.read_write_std(self.joint_cmd, self.gripper_cmd)
+                    print(f"[SDK CMD] GRIP CLOSE ({self.gripper_cmd:.2f})")
+                    return True
+                if hasattr(self.arm, "set_gripper"):
+                    self.arm.set_gripper(self.gripper_cmd)
+                    print(f"[SDK CMD] GRIP CLOSE ({self.gripper_cmd:.2f})")
+                    return True
+                print(f"[SDK CMD] GRIP CLOSE ({self.gripper_cmd:.2f})")
                 return True
-            else:
-                self.ser.write(b"GRIP CLOSE\r\n")
-                response = self.ser.readline().decode().strip()
-                print(f"[ROBOT CMD] GRIPPER CLOSE → {response}")
-                return True
+
+            response = self.send_command("GRIP CLOSE")
+            print(f"[ROBOT CMD] GRIPPER CLOSE → {response}")
+            return True
         except Exception as e:
             print(f"Gripper error: {e}")
             return False
