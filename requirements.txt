@@ -1,4 +1,8 @@
-numpy>=1.21.0
+numpy>=1.21.0,<2.0
 opencv-python>=4.6.0
 mediapipe>=0.8.0
 pyserial>=3.5
+pygame>=2.5.0
+pillow>=10.0.0
+ultralytics>=8.0.0
+inference-sdk
