@@ -2,3 +2,7 @@ numpy>=1.21.0
 opencv-python>=4.6.0
 mediapipe>=0.8.0
 pyserial>=3.5
+roboflow>=1.1.25
+inference-sdk>=0.13.0
+ultralytics>=8.0.0
+python-dotenv>=1.0.0
