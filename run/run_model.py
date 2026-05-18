@@ -17,6 +17,14 @@ import pygame
 from pal.products.qarm_mini import QArmMini
 from pal.utilities.timing import QTimer
 
+#Atech Integration imports
+import json
+
+try:
+    import serial
+except ImportError:
+    serial = None
+
 
 SAMPLE_RATE_HZ = 5.0
 RUN_TIME_SECONDS = 300.0
@@ -1186,7 +1194,111 @@ def detection_color(class_id):
         (45, 212, 191),
     ]
     return palette[class_id % len(palette)]
+ATECH_TO_MODEL_OBJECT = {
+    "Paper Cup": "paper cup",
+    "Plastic Bottle": "plastic bottles",
+    "Metal Can": "metal cans",
+    "Pen/Marker": "marker",
+    "Paper Crumble": "paper crumble",
+}
 
+#start of AtechBridge and related function definitions
+class AtechBridge:
+    def __init__(self, port="/dev/cu.usbmodem101", baudrate=115200):
+        self.enabled = False
+
+        # Status button
+        self.running = False
+
+        # Board activation button
+        self.board_active = False
+
+        # Object selector
+        self.selected_object_label = "Paper Cup"
+        self.selected_model_name = "paper cup"
+
+        if serial is None:
+            print("Atech disabled: pyserial not installed.")
+            return
+
+        try:
+            self.ser = serial.Serial(port, baudrate, timeout=0.01)
+            self.enabled = True
+            print(f"Atech connected on {port}")
+        except Exception as exc:
+            print(f"Atech disabled: {exc}")
+
+    def read_controls(self):
+        if not self.enabled:
+            return
+
+        while self.ser.in_waiting:
+            line = self.ser.readline().decode(errors="ignore").strip()
+
+            if not line:
+                continue
+
+            # Atech JSON events
+            if line.startswith("{"):
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                payload = msg.get("payload", {})
+                key = payload.get("key")
+                value = payload.get("value")
+
+                if key == "status":
+                    self.running = value == "START"
+                    print(f"Atech status: {value}")
+
+                elif key == "board_status":
+                    self.board_active = value == "Activated"
+                    print(f"Atech board: {value}")
+
+                elif key == "selected_object":
+                    self.selected_object_label = str(value)
+                    self.selected_model_name = ATECH_TO_MODEL_OBJECT.get(
+                        self.selected_object_label,
+                        self.selected_object_label.lower(),
+                    )
+                    print(f"Atech selected object: {self.selected_model_name}")
+
+            # Backup support for plain printed serial lines
+            elif line.startswith("Status:"):
+                self.running = "START" in line
+                print("Atech status:", "START" if self.running else "STOP")
+
+            elif line.startswith("Board Status:"):
+                self.board_active = "Activated" in line
+                print("Atech board:", "Activated" if self.board_active else "Not Activated")
+
+            elif line.startswith("Object:"):
+                label = line.split("Object:", 1)[1].strip()
+                self.selected_object_label = label
+                self.selected_model_name = ATECH_TO_MODEL_OBJECT.get(
+                    label,
+                    label.lower(),
+                )
+                print(f"Atech selected object: {self.selected_model_name}")
+
+    def close(self):
+        if self.enabled:
+            self.ser.close()
+
+def choose_atech_target_index(vision, selected_model_name):
+    targets = target_detections(vision)
+
+    if not targets:
+        return 0
+
+    for index, det in enumerate(targets):
+        if det["name"].lower() == selected_model_name.lower():
+            return index
+
+    return 0
+#End of AtechBridge and related function definitions
 
 def main():
     args = parse_args()
@@ -1200,6 +1312,7 @@ def main():
 
     cap = None if args.no_camera else open_camera(args.camera_index)
     vision = load_vision_backend(args) if cap is not None else None
+    atech = AtechBridge("/dev/cu.usbmodem101")
 
     myMiniArm = QArmMini(hardware=1, id=3)
     timer = QTimer(sampleRate=SAMPLE_RATE_HZ, totalTime=RUN_TIME_SECONDS)
@@ -1213,6 +1326,7 @@ def main():
 
     try:
         while timer.check():
+            atech.read_controls()
             should_quit, gripper_cmd, toggle_auto_center, next_center_target = handle_keydown_events(
                 joint_cmd,
                 gripper_cmd,
@@ -1238,21 +1352,42 @@ def main():
                 print(f"Center target: {center_status}")
 
             apply_arrow_key_motion(joint_cmd, timer.get_sample_time())
-            if auto_center_enabled:
-                center_status, selected_target_index = apply_auto_center_motion(
-                    joint_cmd,
-                    vision,
-                    timer.get_sample_time(),
-                    args,
-                    selected_target_index,
-                )
-            myMiniArm.read_write_std(joint_cmd, gripper_cmd)
 
             frame = read_camera_frame(cap)
             if frame is not None:
                 frame_number += 1
                 if vision is not None:
                     frame = vision.annotate(frame, frame_number)
+
+            if atech.board_active:
+                selected_target_index = choose_atech_target_index(
+                    vision,
+                    atech.selected_model_name,
+                )
+
+                auto_center_enabled = atech.running
+
+                if auto_center_enabled:
+                    center_status, selected_target_index = apply_auto_center_motion(
+                        joint_cmd,
+                        vision,
+                        timer.get_sample_time(),
+                        args,
+                        selected_target_index,
+                    )
+                else:
+                    center_status = "Atech stopped"
+            else:
+                if auto_center_enabled:
+                    center_status, selected_target_index = apply_auto_center_motion(
+                        joint_cmd,
+                        vision,
+                        timer.get_sample_time(),
+                        args,
+                        selected_target_index,
+                    )
+
+            myMiniArm.read_write_std(joint_cmd, gripper_cmd)
 
             draw_keyboard_window(
                 font,
@@ -1276,6 +1411,7 @@ def main():
             cap.release()
         if vision is not None and hasattr(vision, "shutdown"):
             vision.shutdown()
+        atech.close()
         myMiniArm.terminate()
         pygame.quit()
 
