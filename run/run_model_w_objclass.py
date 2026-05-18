@@ -384,7 +384,14 @@ def parse_args():
     parser.add_argument(
         "--auto-pick",
         action="store_true",
-        help="Enable auto pick loop: automatically pick first detected object and place into its zone.",
+        default=parse_bool_env(os.environ.get("AUTO_PICK"), True),
+        help="Automatically detect, pick, and place one object. Enabled by default.",
+    )
+    parser.add_argument(
+        "--manual-pick",
+        action="store_false",
+        dest="auto_pick",
+        help="Disable automatic one-shot pick/place and use keyboard controls only.",
     )
     parser.add_argument(
         "--zone-b-xyz",
@@ -1383,6 +1390,7 @@ class GrabController:
         self.pick_gamma = None
         self.selected_target_index = 0
         self.grip_hold_joint_cmd = None
+        self.completed_count = 0
 
     def start(self, vision, selected_target_index):
         if self.calibration is None:
@@ -1609,6 +1617,7 @@ class GrabController:
         self.state = "idle"
         self.status = "complete"
         self.grip_hold_joint_cmd = None
+        self.completed_count += 1
         print(f"Grab: placed {name} in {zone}")
 
 
@@ -2085,6 +2094,7 @@ def main():
     auto_center_enabled = False
     center_status = "center off"
     selected_target_index = 0
+    auto_pick_started = False
 
     try:
         zones_locked = all(z in zones and zones[z].get("workspace_m") for z in ("ZONE_A", "ZONE_B", "ZONE_C"))
@@ -2133,13 +2143,15 @@ def main():
                 auto_center_enabled = False
                 center_status = "center off"
 
-            # Auto-pick: if enabled and controller idle, start a grab on the first detection
+            # Auto-pick is one-shot: start once on the first detected target, then stop.
             if (
                 getattr(args, "auto_pick", False)
+                and not auto_pick_started
                 and not grab_controller.active
                 and vision is not None
                 and first_target_detection(vision) is not None
             ):
+                auto_pick_started = True
                 selected_target_index, gripper_cmd = grab_controller.start(vision, selected_target_index)
                 auto_center_enabled = False
                 center_status = "center off"
@@ -2164,6 +2176,10 @@ def main():
                 selected_target_index,
             )
             myMiniArm.read_write_std(joint_cmd, gripper_cmd)
+
+            if getattr(args, "auto_pick", False) and grab_controller.completed_count >= 1:
+                print("Auto-pick complete: one object was picked and placed. Exiting.")
+                break
 
             # If user requested a zone record (press 1/2/3), capture measured joints and FK then save
             if record_zone is not None:

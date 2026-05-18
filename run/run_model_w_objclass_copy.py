@@ -1671,6 +1671,7 @@ class GrabController:
         self.status = f"rotate drop {zone}"
         if reached:
             self._enter("opening", "opening gripper")
+            return GRIPPER_OPEN, self.selected_target_index
         return GRIPPER_CLOSED, self.selected_target_index
 
     def _update_grip_settle(self, joint_cmd, args):
@@ -2278,6 +2279,15 @@ def main():
             if cancel_grab:
                 grab_controller.cancel()
             if start_grab:
+                selected_target_index, gripper_cmd = grab_controller.start(vision, selected_target_index)
+                auto_center_enabled = False
+                center_status = "center off"
+
+            if (
+                not grab_controller.active
+                and grab_controller.state == "idle"
+                and first_target_detection(vision) is not None
+            ):
                 selected_target_index, gripper_cmd = grab_controller.start(vision, selected_target_index)
                 auto_center_enabled = False
                 center_status = "center off"
