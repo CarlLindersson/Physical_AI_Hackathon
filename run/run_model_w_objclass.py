@@ -40,11 +40,17 @@ DEFAULT_ROBOFLOW_WORKFLOW_ID = "qarm-trash-ensemble-detection-1779037824337"
 DEFAULT_ROBOFLOW_FALLBACK_WORKFLOW_ID = "qarm-trash-detection-1779035433585"
 
 ZONE_MAP = {
-    "plastic bottles": "ZONE_A",
-    "paper cup": "ZONE_B",
+    # Map detected class names to zones: paper -> ZONE_A, plastic -> ZONE_B, metal -> ZONE_C
+    "paper": "ZONE_A",
+    "paper cup": "ZONE_A",
+    "paper crumble": "ZONE_A",
+    "paper box": "ZONE_A",
+    "plastic": "ZONE_B",
+    "plastic bottles": "ZONE_B",
+    "bottle": "ZONE_B",
+    "metal": "ZONE_C",
     "metal cans": "ZONE_C",
-    "paper crumble": "ZONE_B",
-    "paper box": "ZONE_B",
+    "can": "ZONE_C",
     "marker": "ZONE_D",
     "pen": "ZONE_D",
 }
@@ -376,6 +382,11 @@ def parse_args():
         help="Path to read/write taught zone poses (JSON).",
     )
     parser.add_argument(
+        "--auto-pick",
+        action="store_true",
+        help="Enable auto pick loop: automatically pick first detected object and place into its zone.",
+    )
+    parser.add_argument(
         "--zone-b-xyz",
         type=parse_optional_xyz,
         default=parse_optional_xyz(os.environ.get("ZONE_B_XYZ")),
@@ -485,10 +496,13 @@ def print_controls(camera_index, camera_enabled):
         print("  Camera      disabled")
     print("  Up/Down     shoulder up/down")
     print("  Left/Right  base left/right")
+    print("  A/D         elbow in/out")
     print("  w/s         wrist up/down")
     print("  p           close gripper")
     print("  o           open gripper")
     print("  h           home position with wrist down")
+    print("  1/2/3       record zone A/B/C (saves run/zones.json)")
+    print("  Shift+1/2/3 overwrite a saved zone")
     print("  c           toggle camera/object centering")
     print("  n           center next detected target")
     print("  g           calibrated pick/place first target")
@@ -928,6 +942,7 @@ def apply_arrow_key_motion(joint_cmd, timestep):
 
     joint_cmd[0] += (int(keys[pygame.K_LEFT]) - int(keys[pygame.K_RIGHT])) * step
     joint_cmd[1] += (int(keys[pygame.K_UP]) - int(keys[pygame.K_DOWN])) * step
+    joint_cmd[2] += (int(keys[pygame.K_d]) - int(keys[pygame.K_a])) * step
     joint_cmd[3] += (int(keys[pygame.K_w]) - int(keys[pygame.K_s])) * step
 
     np.clip(joint_cmd, QArmMini.LIMITS_MIN, QArmMini.LIMITS_MAX, out=joint_cmd)
@@ -1426,6 +1441,11 @@ class GrabController:
             if detection is None:
                 self.status = "waiting for target"
                 return GRIPPER_OPEN, 0
+            # Map detection name to zone if zone not provided by vision backend
+            if detection.get("zone") is None:
+                det_name = detection.get("name") or ""
+                detection["zone"] = ZONE_MAP.get(det_name.lower(), "ZONE_B")
+
             if not self._build_plan(detection, args, arm_math, joint_cmd):
                 return GRIPPER_OPEN, 0
             self._enter("move_object_approach", "object approach")
@@ -2109,6 +2129,17 @@ def main():
             if cancel_grab:
                 grab_controller.cancel()
             if start_grab:
+                selected_target_index, gripper_cmd = grab_controller.start(vision, selected_target_index)
+                auto_center_enabled = False
+                center_status = "center off"
+
+            # Auto-pick: if enabled and controller idle, start a grab on the first detection
+            if (
+                getattr(args, "auto_pick", False)
+                and not grab_controller.active
+                and vision is not None
+                and first_target_detection(vision) is not None
+            ):
                 selected_target_index, gripper_cmd = grab_controller.start(vision, selected_target_index)
                 auto_center_enabled = False
                 center_status = "center off"
