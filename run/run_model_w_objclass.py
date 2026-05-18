@@ -18,6 +18,7 @@ import pygame
 from hal.content.qarm_mini import QArmMiniFunctions
 from pal.products.qarm_mini import QArmMini
 from pal.utilities.timing import QTimer
+from pathlib import Path
 
 
 SAMPLE_RATE_HZ = 10.0
@@ -370,6 +371,11 @@ def parse_args():
         help="Override Zone A release XYZ in meters, e.g. 0.20,0.12,0.08.",
     )
     parser.add_argument(
+        "--zones-file",
+        default=os.environ.get("ZONES_FILE", "run/zones.json"),
+        help="Path to read/write taught zone poses (JSON).",
+    )
+    parser.add_argument(
         "--zone-b-xyz",
         type=parse_optional_xyz,
         default=parse_optional_xyz(os.environ.get("ZONE_B_XYZ")),
@@ -511,6 +517,27 @@ def load_vision_backend(args):
         return load_roboflow(args)
 
     return load_pit_yolo(args)
+
+
+def load_zones_file(path):
+    try:
+        p = Path(path)
+        if not p.exists():
+            return {}
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_zones_file(path, data):
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return True
+    except Exception as exc:
+        print(f"Warning: could not save zones file: {exc}")
+        return False
 
 
 def load_roboflow(args):
@@ -845,6 +872,7 @@ def handle_keydown_events(joint_cmd, gripper_cmd, vision=None):
     start_grab = False
     cancel_grab = False
     home_requested = False
+    record_zone = None
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -872,6 +900,15 @@ def handle_keydown_events(joint_cmd, gripper_cmd, vision=None):
                 cancel_grab = True
             elif event.key == pygame.K_t and vision is not None and hasattr(vision, "print_stats"):
                 vision.print_stats()
+            elif event.key == pygame.K_1:
+                record_zone = "ZONE_A"
+                print("Requested record: ZONE_A")
+            elif event.key == pygame.K_2:
+                record_zone = "ZONE_B"
+                print("Requested record: ZONE_B")
+            elif event.key == pygame.K_3:
+                record_zone = "ZONE_C"
+                print("Requested record: ZONE_C")
 
     return (
         should_quit,
@@ -881,6 +918,7 @@ def handle_keydown_events(joint_cmd, gripper_cmd, vision=None):
         start_grab,
         cancel_grab,
         home_requested,
+        record_zone,
     )
 
 
@@ -2006,6 +2044,16 @@ def main():
     vision = load_vision_backend(args) if cap is not None else None
     calibration = load_calibration_map(args)
 
+    # load taught zones file (optional)
+    zones = load_zones_file(args.zones_file) if getattr(args, "zones_file", None) else {}
+    # if workspace coords present in zones file, use them as overrides when CLI args missing
+    if getattr(args, "zone_a_xyz", None) is None and zones.get("ZONE_A", {}).get("workspace_m"):
+        args.zone_a_xyz = zones["ZONE_A"]["workspace_m"]
+    if getattr(args, "zone_b_xyz", None) is None and zones.get("ZONE_B", {}).get("workspace_m"):
+        args.zone_b_xyz = zones["ZONE_B"]["workspace_m"]
+    if getattr(args, "zone_c_xyz", None) is None and zones.get("ZONE_C", {}).get("workspace_m"):
+        args.zone_c_xyz = zones["ZONE_C"]["workspace_m"]
+
     myMiniArm = QArmMini(hardware=1, id=3)
     arm_math = QArmMiniFunctions()
     grab_controller = GrabController(calibration)
@@ -2019,6 +2067,7 @@ def main():
     selected_target_index = 0
 
     try:
+        zones_locked = all(z in zones and zones[z].get("workspace_m") for z in ("ZONE_A", "ZONE_B", "ZONE_C"))
         while timer.check():
             (
                 should_quit,
@@ -2028,6 +2077,7 @@ def main():
                 start_grab,
                 cancel_grab,
                 home_requested,
+                record_zone,
             ) = handle_keydown_events(
                 joint_cmd,
                 gripper_cmd,
@@ -2083,6 +2133,47 @@ def main():
                 selected_target_index,
             )
             myMiniArm.read_write_std(joint_cmd, gripper_cmd)
+
+            # If user requested a zone record (press 1/2/3), capture measured joints and FK then save
+            if record_zone is not None:
+                try:
+                    # if zones already all recorded, ignore unless user holds Shift
+                    mods = pygame.key.get_mods()
+                    shift_held = bool(mods & pygame.KMOD_SHIFT)
+                    existing = zones.get(record_zone, {}).get("workspace_m")
+                    if zones_locked and not shift_held:
+                        print(f"All zones already recorded; hold Shift+{record_zone[-1]} to overwrite.")
+                    elif existing and not shift_held:
+                        print(f"{record_zone} already recorded. Hold Shift+{record_zone[-1]} to overwrite.")
+                    else:
+                        measured = getattr(myMiniArm, "positionMeasured", None)
+                        if measured is not None:
+                            joints_meas = np.asarray(measured, dtype=float)[:4].copy()
+                        else:
+                            joints_meas = np.asarray(joint_cmd, dtype=float).copy()
+                        # compute FK
+                        try:
+                            pos, _, _ = arm_math.forward_kinematics(joints_meas)
+                            workspace_m = [float(x) for x in pos]
+                        except Exception:
+                            workspace_m = None
+
+                        entry = {
+                            "joint_cmd_rad": [float(x) for x in list(joints_meas)],
+                            "joint_cmd_deg": [float(x) for x in list(np.rad2deg(joints_meas))],
+                            "workspace_m": workspace_m,
+                        }
+                        zones[record_zone] = entry
+                        saved = save_zones_file(args.zones_file, zones)
+                        print(f"Recorded {record_zone}: {entry}")
+                        if saved:
+                            print(f"Saved zones to {args.zones_file}")
+                        # recompute locked state
+                        zones_locked = all(z in zones and zones[z].get("workspace_m") for z in ("ZONE_A", "ZONE_B", "ZONE_C"))
+                        if zones_locked:
+                            print("All three zones recorded — recording now locked. Hold Shift+1/2/3 to overwrite.")
+                except Exception as exc:
+                    print(f"Error recording zone {record_zone}: {exc}")
 
             frame = read_camera_frame(cap)
             if frame is not None:
