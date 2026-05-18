@@ -83,13 +83,13 @@ source .venv/bin/activate
 
 ## Configuration
 
-Create a local `.env.local` file for Roboflow credentials. This file should stay out of Git.
+Create a local `.env.local` file for Roboflow credentials. New users need to create their own Roboflow account/API key and update the workspace and workflow IDs to match their own project. This file should stay out of Git.
 
 ```text
-ROBOFLOW_API_KEY=your_api_key
-ROBOFLOW_WORKSPACE_NAME=eshitas-workspace-gas5f
-ROBOFLOW_WORKFLOW_ID=qarm-trash-ensemble-detection-1779037824337
-ROBOFLOW_FALLBACK_WORKFLOW_ID=qarm-trash-detection-1779035433585
+ROBOFLOW_API_KEY=your_roboflow_api_key
+ROBOFLOW_WORKSPACE_NAME=your_workspace_name
+ROBOFLOW_WORKFLOW_ID=your_workflow_id
+ROBOFLOW_FALLBACK_WORKFLOW_ID=optional_fallback_workflow_id
 ROBOFLOW_API_URL=https://serverless.roboflow.com
 ROBOFLOW_IMAGE_KEY=image
 ROBOFLOW_CONFIDENCE=0.0
