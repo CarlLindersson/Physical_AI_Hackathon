@@ -2,3 +2,5 @@ numpy>=1.21.0,<2.0
 opencv-python>=4.6.0
 mediapipe>=0.8.0
 pyserial>=3.5
+ultralytics>=8.0.0
+inference-sdk>=1.0.0

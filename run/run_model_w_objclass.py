@@ -485,10 +485,13 @@ def print_controls(camera_index, camera_enabled):
         print("  Camera      disabled")
     print("  Up/Down     shoulder up/down")
     print("  Left/Right  base left/right")
+    print("  A/D         elbow in/out")
     print("  w/s         wrist up/down")
     print("  p           close gripper")
     print("  o           open gripper")
     print("  h           home position with wrist down")
+    print("  1/2/3       record zone A/B/C (saves run/zones.json)")
+    print("  Shift+1/2/3 overwrite a saved zone")
     print("  c           toggle camera/object centering")
     print("  n           center next detected target")
     print("  g           calibrated pick/place first target")
@@ -928,6 +931,7 @@ def apply_arrow_key_motion(joint_cmd, timestep):
 
     joint_cmd[0] += (int(keys[pygame.K_LEFT]) - int(keys[pygame.K_RIGHT])) * step
     joint_cmd[1] += (int(keys[pygame.K_UP]) - int(keys[pygame.K_DOWN])) * step
+    joint_cmd[2] += (int(keys[pygame.K_d]) - int(keys[pygame.K_a])) * step
     joint_cmd[3] += (int(keys[pygame.K_w]) - int(keys[pygame.K_s])) * step
 
     np.clip(joint_cmd, QArmMini.LIMITS_MIN, QArmMini.LIMITS_MAX, out=joint_cmd)
