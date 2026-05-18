@@ -1,0 +1,51 @@
+{
+  "camera_model": "opencv_fisheye",
+  "created_at_unix": 1779116717.2695594,
+  "camera": {
+    "index": 1,
+    "width": 640,
+    "height": 480
+  },
+  "checkerboard": {
+    "inner_corners_cols": 9,
+    "inner_corners_rows": 6,
+    "square_size": 1.0
+  },
+  "sample_count": 20,
+  "rms_reprojection_error": 0.8442374145490308,
+  "K": [
+    [
+      374.205048253006,
+      0.0,
+      347.413998501109
+    ],
+    [
+      0.0,
+      500.136737205687,
+      256.467679462787
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "D": [
+    [
+      0.061610804333
+    ],
+    [
+      -0.324679335555
+    ],
+    [
+      0.359187261182
+    ],
+    [
+      -0.1558541106
+    ]
+  ],
+  "notes": [
+    "Use cv2.fisheye.undistortPoints for object bbox centers before table mapping.",
+    "Calibration is resolution-specific; keep run_model camera size identical."
+  ]
+}

@@ -181,6 +181,23 @@ def detect_checkerboard(
     return True, corners, gray
 
 
+def draw_checkerboard_preview(
+    frame: np.ndarray,
+    pattern_size: tuple[int, int],
+    corners: np.ndarray | None,
+    found: bool,
+) -> None:
+    if not found or corners is None:
+        return
+
+    draw_corners = np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2)
+    expected_corners = int(pattern_size[0] * pattern_size[1])
+    if draw_corners.shape[0] != expected_corners:
+        return
+
+    cv2.drawChessboardCorners(frame, pattern_size, np.ascontiguousarray(draw_corners), True)
+
+
 def draw_status(
     frame: np.ndarray,
     lines: list[str],
@@ -231,8 +248,7 @@ def capture_samples(args: argparse.Namespace) -> tuple[list[np.ndarray], list[np
             display = frame.copy()
             found, corners, _ = detect_checkerboard(frame, pattern_size, args.subpix_window)
 
-            if found and corners is not None:
-                cv2.drawChessboardCorners(display, pattern_size, corners.reshape(-1, 1, 2), found)
+            draw_checkerboard_preview(display, pattern_size, corners, found)
 
             if undistort_preview and calibrated_preview is not None:
                 display = undistort_frame(display, calibrated_preview, args.balance)

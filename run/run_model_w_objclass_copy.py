@@ -20,7 +20,7 @@ from pal.products.qarm_mini import QArmMini
 from pal.utilities.timing import QTimer
 
 
-SAMPLE_RATE_HZ = 10.0
+SAMPLE_RATE_HZ = 20.0
 RUN_TIME_SECONDS = 300.0
 JOINT_SPEED_RAD_PER_SEC = np.pi / 4
 CENTER_MAX_SPEED_RAD_PER_SEC = np.pi / 10
@@ -33,6 +33,7 @@ WINDOW_HEIGHT = CAMERA_HEIGHT
 
 GRIPPER_OPEN = 0.0
 GRIPPER_CLOSED = 1.0
+DEFAULT_GRIP_BBOX_SQUEEZE_FRACTION = 0.25
 
 DEFAULT_ROBOFLOW_WORKSPACE = "eshitas-workspace-gas5f"
 DEFAULT_ROBOFLOW_WORKFLOW_ID = "qarm-trash-ensemble-detection-1779037824337"
@@ -44,8 +45,8 @@ ZONE_MAP = {
     "metal cans": "ZONE_C",
     "paper crumble": "ZONE_B",
     "paper box": "ZONE_B",
-    "marker": "ZONE_D",
-    "pen": "ZONE_D",
+    "marker": "ZONE_A",
+    "pen": "ZONE_A",
 }
 
 CENTER_TARGET_X_RATIO = 0.5
@@ -78,6 +79,7 @@ DEFAULT_PICK_Z_OFFSET_M = 0.000
 DEFAULT_PICK_JOINT_SPEED_RAD_PER_SEC = np.pi / 5
 DEFAULT_PICK_JOINT_TOLERANCE_RAD = np.deg2rad(1.0)
 DEFAULT_PICK_HOME_SETTLE_TICKS = 5
+DEFAULT_HOME_CAMERA_SETTLE_SECONDS = 1.5
 DEFAULT_ZONE_APPROACH_M = 0.060
 DEFAULT_ZONE_RELEASE_Z_OFFSET_M = 0.080
 DEFAULT_ZONE_SIDE_OFFSET_M = 0.120
@@ -262,6 +264,12 @@ def parse_args():
         help="Close the gripper when the selected target box covers this frame area ratio.",
     )
     parser.add_argument(
+        "--grip-bbox-squeeze-fraction",
+        type=float,
+        default=float(os.environ.get("GRIP_BBOX_SQUEEZE_FRACTION", str(DEFAULT_GRIP_BBOX_SQUEEZE_FRACTION))),
+        help="Automated grab close amount as a fraction of full gripper close. Default 0.25.",
+    )
+    parser.add_argument(
         "--grab-centered-frames",
         type=int,
         default=int(os.environ.get("GRAB_CENTERED_FRAMES", str(GRAB_CENTERED_FRAMES))),
@@ -375,6 +383,12 @@ def parse_args():
         type=int,
         default=int(os.environ.get("PICK_HOME_SETTLE_TICKS", str(DEFAULT_PICK_HOME_SETTLE_TICKS))),
         help="Control-loop ticks to wait at wrist-down home before reading the first detection.",
+    )
+    parser.add_argument(
+        "--home-camera-settle-seconds",
+        type=float,
+        default=float(os.environ.get("HOME_CAMERA_SETTLE_SECONDS", str(DEFAULT_HOME_CAMERA_SETTLE_SECONDS))),
+        help="Seconds to hold at home after a vision refresh before reading the next bounding box.",
     )
     parser.add_argument(
         "--zone-approach-m",
@@ -813,7 +827,7 @@ def draw_keyboard_window(
     draw_text(
         screen,
         small_font,
-        f"Gripper: {'closed' if gripper_cmd == GRIPPER_CLOSED else 'open'}",
+        f"Gripper: {'open' if gripper_cmd <= 0.01 else 'holding'} ({gripper_cmd:.2f})",
         (panel_x, y),
         (240, 240, 240),
     )
@@ -1013,6 +1027,30 @@ def first_target_detection(vision):
     return targets[0]
 
 
+def snapshot_detection(detection):
+    snapshot = dict(detection)
+    if detection.get("box") is not None:
+        snapshot["box"] = list(detection["box"])
+    return snapshot
+
+
+def request_vision_refresh(vision):
+    if vision is None:
+        return
+    refresh = getattr(vision, "request_refresh", None)
+    if callable(refresh):
+        refresh()
+        return
+    if hasattr(vision, "detections"):
+        vision.detections = []
+
+
+def home_camera_settle_ticks(args):
+    camera_ticks = int(np.ceil(max(0.0, args.home_camera_settle_seconds) * SAMPLE_RATE_HZ))
+    manual_ticks = max(0, int(args.pick_home_settle_ticks))
+    return max(camera_ticks, manual_ticks)
+
+
 def selected_target_status(detection, targets, target_index):
     name = short_text(detection["name"], 18)
     return f"#{target_index + 1}/{len(targets)} {name}"
@@ -1095,6 +1133,19 @@ def detection_area_ratio(detection):
     x1, y1, x2, y2 = box
     area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
     return area / float(CAMERA_WIDTH * CAMERA_HEIGHT)
+
+
+def detection_box_size(detection):
+    box = detection.get("box")
+    if box is None:
+        return 0.0, 0.0
+    x1, y1, x2, y2 = [float(value) for value in box]
+    return max(0.0, x2 - x1), max(0.0, y2 - y1)
+
+
+def planned_gripper_close_command(detection, args):
+    squeeze_fraction = float(np.clip(args.grip_bbox_squeeze_fraction, 0.0, 1.0))
+    return float(GRIPPER_OPEN + (GRIPPER_CLOSED - GRIPPER_OPEN) * squeeze_fraction)
 
 
 def move_end_effector_delta(joint_cmd, arm_math, delta_pos):
@@ -1468,6 +1519,7 @@ class GrabController:
         self.post_close_ticks = 0
         self.pick_gamma = None
         self.selected_target_index = 0
+        self.locked_detection = None
         self.grip_hold_joint_cmd = None
         self.drop_joint_target = None
 
@@ -1486,10 +1538,11 @@ class GrabController:
         self.home_settle_ticks = 0
         self.grip_hold_joint_cmd = None
         self.drop_joint_target = None
-        self.selected_target_index = 0
+        self.locked_detection = None
+        self.selected_target_index = max(0, int(selected_target_index))
         self._enter("move_home", "moving home")
         print("Grab: moving to wrist-down home before reading the first target")
-        return 0, GRIPPER_OPEN
+        return self.selected_target_index, GRIPPER_OPEN
 
     def cancel(self):
         if not self.active:
@@ -1503,6 +1556,7 @@ class GrabController:
         self.status = "cancelled"
         self.grip_hold_joint_cmd = None
         self.drop_joint_target = None
+        self.locked_detection = None
 
     def update(self, joint_cmd, gripper_cmd, vision, timestep, args, arm_math, selected_target_index):
         if not self.active:
@@ -1512,28 +1566,41 @@ class GrabController:
             reached = step_joints_toward(joint_cmd, wrist_down_home_pose(), timestep, args)
             self.status = "moving home"
             if reached:
-                self.home_settle_ticks = max(0, args.pick_home_settle_ticks)
+                request_vision_refresh(vision)
+                self.home_settle_ticks = home_camera_settle_ticks(args)
                 self._enter("settle_home", "home settle")
-            return GRIPPER_OPEN, 0
+                print(f"Grab: home reached; waiting {args.home_camera_settle_seconds:.1f}s for camera refresh")
+            return GRIPPER_OPEN, self.selected_target_index
 
         if self.state == "settle_home":
             joint_cmd[:] = wrist_down_home_pose()
             if self.home_settle_ticks > 0:
                 self.home_settle_ticks -= 1
-                self.status = f"home settle {self.home_settle_ticks}"
-                return GRIPPER_OPEN, 0
+                seconds_left = self.home_settle_ticks / SAMPLE_RATE_HZ
+                self.status = f"home camera settle {seconds_left:.1f}s"
+                return GRIPPER_OPEN, self.selected_target_index
             self._enter("acquire_target", "reading first target")
-            return GRIPPER_OPEN, 0
+            return GRIPPER_OPEN, self.selected_target_index
 
         if self.state == "acquire_target":
-            detection = first_target_detection(vision)
-            if detection is None:
-                self.status = "waiting for target"
-                return GRIPPER_OPEN, 0
+            if self.locked_detection is None:
+                detection, targets, target_index = selected_target_detection(vision, self.selected_target_index)
+                if detection is None:
+                    self.status = "waiting for target"
+                    return GRIPPER_OPEN, self.selected_target_index
+                self.selected_target_index = target_index
+                self.locked_detection = snapshot_detection(detection)
+                print(
+                    "Grab: locked target "
+                    f"#{target_index + 1}/{len(targets)} "
+                    f"{short_text(self.locked_detection.get('name', 'object'), 24)}"
+                )
+
+            detection = self.locked_detection
             if not self._build_plan(detection, args, arm_math, joint_cmd):
-                return GRIPPER_OPEN, 0
+                return GRIPPER_OPEN, self.selected_target_index
             self._enter("move_object_approach", "object approach")
-            return GRIPPER_OPEN, 0
+            return GRIPPER_OPEN, self.selected_target_index
 
         move_states = {
             "move_object_approach": ("object_approach_xyz", "move_object_pick", "approach object"),
@@ -1549,7 +1616,7 @@ class GrabController:
             if reached:
                 self._enter(next_state, next_state, joint_cmd)
             gripper = (
-                GRIPPER_CLOSED
+                self._gripper_closed_cmd()
                 if self.state in ("move_lift", "rotate_drop", "move_zone_approach", "move_zone_release")
                 else GRIPPER_OPEN
             )
@@ -1574,6 +1641,7 @@ class GrabController:
             self.open_ticks += 1
             self.status = f"release {self.open_ticks}/{max(1, args.release_open_ticks)}"
             if self.open_ticks >= max(1, args.release_open_ticks):
+                request_vision_refresh(vision)
                 self._enter("return_home", "returning home")
             return GRIPPER_OPEN, self.selected_target_index
 
@@ -1581,12 +1649,18 @@ class GrabController:
             reached = step_joints_toward(joint_cmd, wrist_down_home_pose(), timestep, args)
             self.status = "returning home"
             if reached:
+                self.locked_detection = None
                 if args.no_auto_repeat_grab:
                     self._complete()
                 else:
-                    self.home_settle_ticks = max(0, args.pick_home_settle_ticks)
+                    request_vision_refresh(vision)
+                    self.selected_target_index = 0
+                    self.home_settle_ticks = home_camera_settle_ticks(args)
                     self._enter("settle_home", "home settle")
-                    print("Grab: returned home; looking for next target")
+                    print(
+                        "Grab: returned home; "
+                        f"waiting {args.home_camera_settle_seconds:.1f}s for camera refresh"
+                    )
             return GRIPPER_OPEN, 0
 
         self._fail(f"unknown state {self.state}")
@@ -1611,6 +1685,8 @@ class GrabController:
         lift_xyz[2] = max(object_xyz[2] + args.grab_lift_m, args.min_carry_z_m)
         zone_approach = zone_release + np.array([0.0, 0.0, args.zone_approach_m])
         zone_approach[2] = max(zone_approach[2], lift_xyz[2])
+        gripper_closed_cmd = planned_gripper_close_command(detection, args)
+        bbox_width_px, bbox_height_px = detection_box_size(detection)
         _, _, self.pick_gamma = arm_math.forward_kinematics(wrist_down_home_pose())
 
         self.plan = {
@@ -1625,14 +1701,22 @@ class GrabController:
             "lift_xyz": lift_xyz,
             "zone_release_xyz": zone_release,
             "zone_approach_xyz": zone_approach,
+            "gripper_closed_cmd": gripper_closed_cmd,
         }
         print(
             "Grab target: "
             f"{self.plan['name']} at px ({center_px[0]:.0f}, {center_px[1]:.0f}) "
             f"using {pixel_source} ({mapped_px[0]:.0f}, {mapped_px[1]:.0f}) "
-            f"-> xyz {format_position(object_xyz)} -> lift {format_position(lift_xyz)} -> {zone}"
+            f"bbox {bbox_width_px:.0f}x{bbox_height_px:.0f} "
+            f"-> grip {gripper_closed_cmd:.2f} -> xyz {format_position(object_xyz)} "
+            f"-> lift {format_position(lift_xyz)} -> {zone}"
         )
         return True
+
+    def _gripper_closed_cmd(self):
+        if self.plan is None:
+            return GRIPPER_CLOSED
+        return float(self.plan.get("gripper_closed_cmd", GRIPPER_CLOSED))
 
     def _move_to_xyz(self, joint_cmd, arm_math, xyz, timestep, args, label):
         if self.joint_target is None:
@@ -1650,7 +1734,7 @@ class GrabController:
         lift_target = self.plan.get("lift_joint_target") if self.plan else None
         if lift_target is None:
             self._fail("no lift joint target")
-            return GRIPPER_CLOSED, self.selected_target_index
+            return self._gripper_closed_cmd(), self.selected_target_index
 
         reached = step_joints_toward(joint_cmd, lift_target, timestep, args)
         self.status = (
@@ -1659,19 +1743,19 @@ class GrabController:
         )
         if reached:
             self._enter("rotate_drop", "rotate_drop", joint_cmd)
-        return GRIPPER_CLOSED, self.selected_target_index
+        return self._gripper_closed_cmd(), self.selected_target_index
 
     def _update_rotate_drop(self, joint_cmd, timestep, args):
         if self.drop_joint_target is None:
             self._fail("missing drop rotation target")
-            return GRIPPER_CLOSED, self.selected_target_index
+            return self._gripper_closed_cmd(), self.selected_target_index
 
         reached = step_joints_toward(joint_cmd, self.drop_joint_target, timestep, args)
         zone = self.plan["zone"] if self.plan else "zone"
         self.status = f"rotate drop {zone}"
         if reached:
             self._enter("opening", "opening gripper")
-        return GRIPPER_CLOSED, self.selected_target_index
+        return self._gripper_closed_cmd(), self.selected_target_index
 
     def _update_grip_settle(self, joint_cmd, args):
         if self.grip_hold_joint_cmd is not None:
@@ -1696,7 +1780,7 @@ class GrabController:
         self.status = f"grip still {self.close_ticks}/{max(1, args.grab_close_ticks)}"
         if self.close_ticks >= max(1, args.grab_close_ticks):
             self._enter("post_close", "post grip hold", joint_cmd)
-        return GRIPPER_CLOSED, self.selected_target_index
+        return self._gripper_closed_cmd(), self.selected_target_index
 
     def _prepare_lift_joint_target(self, joint_cmd, args):
         if not self.plan:
@@ -1719,14 +1803,14 @@ class GrabController:
         if total_ticks == 0:
             self._prepare_lift_joint_target(joint_cmd, args)
             self._enter("move_lift", "lifting", joint_cmd)
-            return GRIPPER_CLOSED, self.selected_target_index
+            return self._gripper_closed_cmd(), self.selected_target_index
 
         self.post_close_ticks += 1
         self.status = f"post grip still {self.post_close_ticks}/{total_ticks}"
         if self.post_close_ticks >= total_ticks:
             self._prepare_lift_joint_target(joint_cmd, args)
             self._enter("move_lift", "lifting", joint_cmd)
-        return GRIPPER_CLOSED, self.selected_target_index
+        return self._gripper_closed_cmd(), self.selected_target_index
 
     def _enter(self, state, status, joint_cmd=None):
         self.state = state
@@ -1760,6 +1844,7 @@ class GrabController:
         self.status = f"failed: {short_text(message, 22)}"
         self.grip_hold_joint_cmd = None
         self.drop_joint_target = None
+        self.locked_detection = None
         print(f"Grab failed: {message}")
 
     def _complete(self):
@@ -1770,6 +1855,7 @@ class GrabController:
         self.status = "complete"
         self.grip_hold_joint_cmd = None
         self.drop_joint_target = None
+        self.locked_detection = None
         print(f"Grab: placed {name} in {zone}")
 
 
@@ -1781,6 +1867,9 @@ class InactiveVision:
 
     def annotate(self, frame, frame_number):
         return frame
+
+    def request_refresh(self):
+        self.detections = []
 
     def summary_lines(self, max_lines=3):
         return self.lines[:max_lines]
@@ -1797,12 +1886,14 @@ class YoloClassifier:
         self.detections = []
         self.status = "pit-yolo ready"
         self.fps = None
+        self.refresh_requested = False
 
     def annotate(self, frame, frame_number):
         if not self.enabled:
             return frame
 
-        if frame_number % self.every_n_frames == 0 or not self.detections:
+        if self.refresh_requested or frame_number % self.every_n_frames == 0 or not self.detections:
+            self.refresh_requested = False
             try:
                 prepared = self.model.pre_process(np.ascontiguousarray(frame))
                 result = self.model.predict(
@@ -1822,6 +1913,11 @@ class YoloClassifier:
                 return frame
 
         return frame
+
+    def request_refresh(self):
+        self.refresh_requested = True
+        self.detections = []
+        self.status = "pit-yolo refresh requested"
 
     def summary_lines(self, max_lines=3):
         if not self.detections:
@@ -1902,21 +1998,35 @@ class RoboflowClassifier:
         self.frame_count = 0
         self.detection_count = 0
         self.start_time = time.time()
+        self.refresh_requested = False
+        self.ignore_pending_result = False
 
     def annotate(self, frame, frame_number):
         self._collect_finished_request()
         self.frame_count += 1
 
-        if self.future is None and frame_number % self.every_n_frames == 0:
+        if self.future is None and (self.refresh_requested or frame_number % self.every_n_frames == 0):
+            self.refresh_requested = False
             self.future = self.executor.submit(
                 self._run_workflow_request,
                 np.ascontiguousarray(frame.copy()),
             )
             self.status = "roboflow workflow request..."
 
-        if self.use_annotated_image and self.last_annotated_frame is not None:
-            return self.last_annotated_frame
         return frame
+
+    def request_refresh(self):
+        self.detections = []
+        self.last_detection = None
+        self.last_annotated_frame = None
+        self.last_error = None
+        self.refresh_requested = True
+        self.status = "roboflow refresh requested"
+        if self.future is not None:
+            if self.future.cancel():
+                self.future = None
+            else:
+                self.ignore_pending_result = True
 
     def summary_lines(self, max_lines=3):
         if self.last_error:
@@ -1954,6 +2064,10 @@ class RoboflowClassifier:
             return
 
         try:
+            if self.ignore_pending_result:
+                self.ignore_pending_result = False
+                self.status = "roboflow refresh requested"
+                return
             result, workflow_id = self.future.result()
             output, predictions = self._parse_workflow_result(result)
             self.detections = self._predictions_to_detections(predictions)
