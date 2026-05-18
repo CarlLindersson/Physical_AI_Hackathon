@@ -2,5 +2,4 @@
 .env.local
 *.pyc
 __pycache__/
-academic_resources/
 sim/

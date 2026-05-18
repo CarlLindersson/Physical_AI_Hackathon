@@ -4,6 +4,10 @@ Computer vision guided robotic sorting with a Quanser QArm Mini, Roboflow-hosted
 
 Built during the Oxford Physical AI Hackathon, this project demonstrates how a small desktop robot arm can identify common trash items, classify them as paper, plastic, or metal, and place them into separate bins.
 
+<p align="center">
+  <img src="qarm%20mini.jpeg" alt="Quanser QArm Mini robot used for the trash sorting demo" width="720">
+</p>
+
 ## Overview
 
 The main demo script is [`run/run_model_w_objclass_demo.py`](run/run_model_w_objclass_demo.py). It combines:
